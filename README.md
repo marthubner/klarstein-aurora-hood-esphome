@@ -23,7 +23,7 @@ The panel and the main board talk over one wire (5 V idle) in short frames:
 - **Frame A, panel to hood:** 48 bits carrying fan level, downlight, backlight colour and a checksum
 - **Frame B, hood to panel:** 32 bits carrying the motor feedback, sent within about 3 ms of frame A
 
-The wire is cut and both halves are joined only by the ESP32:
+A small harness board sits between the hood's CN2 connector and the panel plug. It splits the data wire, so the two halves are joined only by the ESP32:
 
 ```
 hood main board (CN2) --- interface --- ESP32-C6 --- interface --- touch panel plug
@@ -42,7 +42,7 @@ Power, ground and the panel's TX wire pass straight through.
 - ESP32-C6 board, powered from the 5 V on the hood's CN2 connector
 - Interface per line, built on a small perfboard module: a 100 k / 220 k divider for receiving (5 V to 3.4 V) and a BC337
   NPN with a 10 k base resistor and a 100 k base-to-emitter resistor for transmitting. The panel side also has a 15 k
-  pull-up to 5 V, because it is cut off from the hood board's own pull-up.
+  pull-up to 5 V, because it is separated from the hood board's own pull-up.
 - JST-XH 4-pin pigtail onto CN2 and a right-angle XH header for the panel plug
 - Printed case, 133 x 58 x 26 mm, with room for the SPS30 and AHT10
 
