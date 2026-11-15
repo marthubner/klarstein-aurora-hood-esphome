@@ -40,15 +40,16 @@ Power, ground and the panel's TX wire pass straight through.
 ## Hardware
 
 - ESP32-C6 board, powered from the 5 V on the hood's CN2 connector
-- Interface per line, built on a small perfboard module: a 100 k / 220 k divider for receiving (5 V to 3.4 V) and a BC337
-  NPN with a 10 k base resistor and a 100 k base-to-emitter resistor for transmitting. The panel side also has a 15 k
-  pull-up to 5 V, because it is separated from the hood board's own pull-up.
+- Interface circuit, one per line (see [schematic.svg](schematic.svg)): a 100 k / 220 k divider for receiving (5 V to 3.4 V) and a BC337 NPN
+  with a 10 k base resistor and a 100 k pull-down on the GPIO side for transmitting. The panel side also has a 15 k pull-up to 5 V,
+  because it is separated from the hood board's own pull-up. In this build the circuit sits on a small plug-in perfboard module,
+  because the first design used a ready-made level-shifter module in the same sockets. You can build it directly on the main board instead.
 - JST-XH 4-pin pigtail onto CN2 and a right-angle XH header for the panel plug
 - Printed case, 133 x 58 x 26 mm, with room for the SPS30 and AHT10
 
 Pins: GPIO18 RX hood line, GPIO19 TX hood line, GPIO20 RX panel line, GPIO21 TX panel line, GPIO22 SDA, GPIO23 SCL.
 
-The connections between the parts, including where the capacitors go, are in [wiring_complete.svg](wiring_complete.svg). The parts list is in [BOM.md](BOM.md).
+All connections, including where the capacitors go, are in [schematic.svg](schematic.svg). The parts list is in [BOM.md](BOM.md).
 
 ## Photos
 
@@ -56,7 +57,7 @@ CN2 on the hood main board. TXD is not used by the hood, RXD carries the single 
 
 ![CN2 pinout on the hood main board](photos/hood_main_board_cn2.jpg)
 
-The finished harness in its printed case, with the ESP32-C6, the interface module and the SPS30:
+The finished harness in its printed case, with the ESP32-C6, the plug-in module with the interface circuit and the SPS30:
 
 ![Harness board in the case](photos/harness_board_in_case.jpg)
 
@@ -73,8 +74,7 @@ The hood interior with the controller box and the rating plate (110 W motor, 9 W
 | Path | Content |
 |---|---|
 | [system_overview.svg](system_overview.svg) | Block diagram: hood board, panel, interface, ESP32-C6, sensors |
-| [wiring_complete.svg](wiring_complete.svg) | Complete wiring diagram: every connection, both power rails and the two capacitors |
-| [interface_schematic.svg](interface_schematic.svg) | Circuit of the interface: receive divider and transmit transistor per line |
+| [schematic.svg](schematic.svg) | Complete schematic: connectors, interface circuit, ESP32-C6, sensors and the two capacitors |
 | [BOM.md](BOM.md) | Bill of materials |
 | [esphome/range-hood.yaml](esphome/range-hood.yaml) | ESPHome firmware |
 | [esphome/secrets.yaml.example](esphome/secrets.yaml.example) | Secrets the firmware expects |
@@ -84,7 +84,7 @@ The hood interior with the controller box and the rating plate (110 W motor, 9 W
 
 ## Build and flash
 
-1. Build the interface module and the main board from the schematic and the BOM. Check the resistance between the
+1. Build the interface circuit and the main board from the schematic and the BOM. Check the resistance between the
    lines and ground before powering anything.
 2. Copy `esphome/secrets.yaml.example` to `secrets.yaml` and fill it in.
 3. Flash `range-hood.yaml` over the ESP32-C6's native USB port. Later updates go over the air.

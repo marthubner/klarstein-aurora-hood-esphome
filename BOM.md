@@ -10,7 +10,7 @@ Digestor: ESP32-C6 between the hood main board (CN2) and the glass touch panel.
 | R1, R3 | 2 | Resistor | 100 k, 0.25 W, 1 % | Receive divider, series leg |
 | R2, R4 | 2 | Resistor | 220 k, 0.25 W, 1 % | Receive divider, ground leg |
 | R5, R7 | 2 | Resistor | 10 k, 0.25 W, 1 % | Transistor base |
-| R6, R8 | 2 | Resistor | 100 k, 0.25 W, 1 % | Base to emitter, keeps the NPN off at boot |
+| R6, R8 | 2 | Resistor | 100 k, 0.25 W, 1 % | Pull-down on the GPIO side of the base resistor, keeps the NPN off at boot |
 | R9 | 1 | Resistor | 15 k, 0.25 W, 1 % | 5 V pull-up on the panel line |
 | Q1, Q2 | 2 | NPN transistor, TO-92 | BC337 | Any small-signal NPN with Vce >= 20 V and hFE >= 50 works (BC547, 2N3904, S8050). Use the same type for both. |
 | C1 | 1 | Electrolytic capacitor | 470 uF / 16 V | On the 5 V rail near the ESP |
@@ -25,11 +25,11 @@ Digestor: ESP32-C6 between the hood main board (CN2) and the glass touch panel.
 | Qty | Part | Notes |
 |---|---|---|
 | 1 | Perfboard 50 x 70 mm | Main board. The case is sized for this board. |
-| 1 | Perfboard strip | Interface module, 7 columns x 11 rows used |
-| 2 | Male header strip, 6 pin | Interface module plugs into the main board with these |
-| 2 | Female header strip, 6 pin | Main board sockets for the interface module |
+| 1 | Perfboard strip | Plug-in module for the interface circuit, 7 columns x 11 rows used |
+| 2 | Male header strip, 6 pin | The plug-in module plugs into the main board with these |
+| 2 | Female header strip, 6 pin | Main board sockets for the plug-in module |
 | 2 | Female header strip, 15 pin | Sockets for the ESP32-C6 board |
-| 2 | Insulated hookup wire, short | The only two wire links on the interface module |
+| 2 | Insulated hookup wire, short | The only two wire links on the plug-in module |
 | 1 | Hookup wire, about 1 m | Power, ground and I2C on the main board |
 
 ## Case and fasteners
@@ -44,5 +44,5 @@ The board standoffs, the SPS30 and AHT10 holders and the vents are part of the p
 
 ## Not in the final build
 
-- The BSS138 4-channel level shifter module. Its 10 k pull-ups load the line too much, so the discrete interface module replaced it.
+- The BSS138 4-channel level shifter module. Its 10 k pull-ups load the line too much, so the discrete interface circuit replaced it. The plug-in module for that circuit uses the sockets of the shifter.
 - Jumper HV2 to HV3 and the 11 k series resistors from the pass-through test.
