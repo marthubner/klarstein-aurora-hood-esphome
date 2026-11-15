@@ -107,3 +107,5 @@ The hood interior with the controller box and the rating plate (110 W motor, 9 W
 Only the hood's low-voltage panel cable is touched: 5 V, ground and the data wire. Do not open or modify anything on
 the mains side. Unplug the hood before opening it, and check the connector pinout on your own unit before connecting
 anything. You do this at your own risk.
+
+This is an independent hobby project. It is not affiliated with or endorsed by Klarstein or Chal-Tec. Klarstein is a trademark of its owner.
