@@ -1,0 +1,798 @@
+# Range hood controller: ESP32-C6 between the hood main board and the glass touch panel.
+#
+# The hood's single-wire bus (touch panel <-> main board) is cut. Both halves are connected only to this ESP, which
+# relays the traffic and can override the fan and lights from Home Assistant. See ../interface_schematic.svg and
+# ../system_overview.svg for the hardware.
+#
+# Pins: GPIO18 RX hood line, GPIO19 TX hood line, GPIO20 RX panel line, GPIO21 TX panel line, GPIO22 SDA, GPIO23 SCL.
+# Every TX pin drives an NPN that pulls the bus low, so the TX pins are not inverted here but the RX pins are
+# (the receiver sees the idle 5 V bus level as a high that is divided down to 3.4 V).
+#
+# Protocol (reverse engineered; "low" and "high" are the bus levels):
+#   Frame A (panel -> hood): 48 bits, each bit is a LOW of ~180 us followed by HIGH 420 us (0) or 1115 us (1).
+#     Bytes are sent LSB first:
+#       b0 fan level code: 00 off, 12 = level 1, 1D = level 2, 2E = level 3
+#       b1 bit 4 fan on, bit 3 downlight on, bits 0-1 beep / indication
+#       b2 backlight colour: 00 off, 01 white, 02 red, 03 green, 04 blue, 05 lime, 06 pink, 07 yellow,
+#          08 turquoise, 09 yellow-green (code 5 looks exactly like code 9, both show as yellow-green here)
+#       b3 light button press counter (0..3)
+#       b4 checksum = (b0 + b1 + b2 + b3) mod 256
+#       b5 trailer, 00 (a periodic frame carries other values and is ignored)
+#     A frame ends with a stop pulse: the line is held low for several ms.
+#   Frame B (hood -> panel, within ~3 ms of frame A): a short LOW, then 32 cells of HIGH gap ~300 us (0) or ~1100 us (1),
+#     each followed by a LOW of ~300 us. Bits 0..15 are zero, bits 16..23 carry the motor feedback value (0 = stopped,
+#     about 70 / 88 / 106 at fan levels 1 / 2 / 3) and bits 24..31 repeat it. It ends with the same stop pulse.
+#
+# Relay: frame A is forwarded panel -> hood, rewritten while Home Assistant overrides the state. The panel expects its
+# frame B within a few ms, far sooner than the hood's real answer could come back through a store-and-forward relay,
+# so this firmware answers the panel itself right after every frame A with a frame B that carries the last decoded
+# motor feedback. Without that the panel keeps retrying frame A and the retries land on top of the hood's frame B.
+# The hood's real frame B is only decoded (sensor "Motor Feedback"), never forwarded.
+# Every capture is split into segments at long pulses (stop pulses, gaps), because one capture can hold our own frame A
+# plus the hood's frame B. The receiver caps the stop pulse at its idle threshold, so the relay re-creates it with the
+# length from the "Stop Pulse" number.
+#
+# Override: when Home Assistant changes the fan or a light, the next frames to the hood carry the requested state. The
+# override is dropped as soon as the panel's own frame changes (someone touched the panel) or when the "Follow Panel"
+# button is pressed. While an override is active, a panel frame that does not decode cleanly is dropped instead of
+# forwarded raw: raw it would carry the panel's own (usually "off") state and the hood would dip for a moment.
+# No override is armed before the first panel frame has been seen.
+# Every command starts from the pending override (script seed_override) and not from the hood's last decoded state:
+# Home Assistant can send several commands at once (for example a light group turning both lights off) before the hood
+# has answered the first one. A command equal to the current target is ignored, and while the hood still runs an older
+# state than the override asks for, decoded frames are not pushed into the entities: a stale push would come back as a
+# command and cancel the override.
+# The glass panel ignores the content of frame B: its display only ever shows its own touch state, so an override from
+# Home Assistant never shows on the glass.
+#
+# Entities: fan "Fan" (3 speeds), lights "Downlight" and "Backlight" (on/off; colour via "Backlight Select"),
+# "Panel Lit" (the panel's own state is active, i.e. its buttons are lit), "Override Active", power and energy
+# estimates, motor feedback, a particulate sensor (SPS30) and a temperature / humidity sensor (AHT10).
+# "last_color" remembers the last non-off colour (kept across reboots), so turning the backlight on from Home Assistant
+# brings back that colour instead of white. The "syncing" global stops the entity callbacks from arming an override
+# while the decoder pushes the state into them.
+#
+# Power model (measured with a plug energy meter, standby included): standby 1.6 W; fan level 1 / 2 / 3 adds
+# 7.6 / 12.9 / 20.9 W; downlight adds 2.1 W; backlight adds per colour: white 7.1, red 2.3, green 2.8, blue 2.6,
+# lime 4.8, pink 4.6, yellow 3.4, turquoise 5.0, yellow-green 4.9 W, times 0.85 while the downlight is on.
+# "Power" is the total including standby. "Fan Power", "Downlight Power" and "Backlight Power" publish the parts
+# without the standby, so Home Assistant can book each part where it belongs; "Fan Energy" integrates the fan part.
+#
+# "Dust Sensor" switch: stops the SPS30 between cooking sessions (its own fan off, less wear); Home Assistant turns it
+# on while something is cooking. After a start the SPS30 needs about 30 s before the first reading; while it is
+# stopped the PM sensors publish NaN so no stale reading stays behind. The switch has restore_mode DISABLED, because the
+# default (ALWAYS_OFF) would run turn_off at boot and stop the SPS30.
+# To keep the Home Assistant recorder small, energy sensors publish only after +1 Wh, temperature after 0.2 C and
+# humidity after 0.5 %.
+#
+# Secrets needed (see secrets.yaml.example): wifi_ssid, wifi_password, api_encryption_key, ap_password.
+# RMT on the ESP32-C6: 48-symbol blocks per channel, 2 RX + 2 TX channels, all used here.
+
+esphome:
+  name: range-hood
+  friendly_name: Range Hood
+
+esp32:
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: range-hood-setup
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 3
+  log: true
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+i2c:
+  sda: GPIO22
+  scl: GPIO23
+  frequency: 100kHz
+  scan: true
+
+globals:
+  - id: last_frame
+    type: uint32_t
+    initial_value: '0xFFFFFFFF'
+  - id: last_fb
+    type: int
+    initial_value: '-1'
+  - id: eff_level
+    type: int
+    initial_value: '-1'
+  - id: eff_down
+    type: bool
+    initial_value: 'false'
+  - id: eff_color
+    type: int
+    initial_value: '0'
+  - id: ovr_active
+    type: bool
+    initial_value: 'false'
+  - id: ovr_level
+    type: int
+    initial_value: '0'
+  - id: ovr_down
+    type: bool
+    initial_value: 'false'
+  - id: ovr_color
+    type: int
+    initial_value: '0'
+  - id: pb0
+    type: int
+    initial_value: '-1'
+  - id: pb1
+    type: int
+    initial_value: '-1'
+  - id: pb2
+    type: int
+    initial_value: '-1'
+  - id: base_b0
+    type: int
+    initial_value: '-1'
+  - id: base_b1
+    type: int
+    initial_value: '-1'
+  - id: base_b2
+    type: int
+    initial_value: '-1'
+  - id: relayed_a
+    type: uint32_t
+    initial_value: '0'
+  - id: relayed_b
+    type: uint32_t
+    initial_value: '0'
+  - id: answered_b
+    type: uint32_t
+    initial_value: '0'
+  - id: stop_us
+    type: int
+    initial_value: '3500'
+  - id: syncing
+    type: bool
+    initial_value: 'false'
+  - id: last_color
+    type: int
+    restore_value: true
+    initial_value: '1'
+  - id: sps30_on
+    type: bool
+    initial_value: 'true'
+
+script:
+  - id: seed_override
+    then:
+      - lambda: |-
+          if (id(ovr_active)) return;
+          id(ovr_level) = id(eff_level) < 0 ? 0 : id(eff_level);
+          id(ovr_down) = id(eff_down);
+          id(ovr_color) = id(eff_color);
+  - id: arm_override
+    then:
+      - lambda: |-
+          id(base_b0) = id(pb0);
+          id(base_b1) = id(pb1);
+          id(base_b2) = id(pb2);
+          id(ovr_active) = true;
+          ESP_LOGI("hood", "override armed: level %d downlight %d color %d (panel %02X %02X %02X)",
+                   id(ovr_level), id(ovr_down), id(ovr_color), id(pb0), id(pb1), id(pb2));
+
+remote_transmitter:
+  - id: tx_hood
+    pin: GPIO19
+    carrier_duty_percent: 100%
+    rmt_symbols: 48
+    non_blocking: true
+  - id: tx_panel
+    pin: GPIO21
+    carrier_duty_percent: 100%
+    rmt_symbols: 48
+    non_blocking: true
+
+remote_receiver:
+  - id: rx_board_side
+    pin:
+      number: GPIO18
+      inverted: true
+    idle: 3ms
+    rmt_symbols: 48
+    receive_symbols: 192
+    tolerance: 30%
+    on_raw:
+      - lambda: |-
+          // split the capture into segments at every long pulse (stop pulses, gaps); a frame starts with a low pulse
+          std::vector<std::vector<int32_t>> segs(1);
+          for (auto d : x) {
+            int a = d < 0 ? -d : d;
+            if (a == 0) continue;
+            if (a >= 2000) { if (!segs.back().empty()) segs.emplace_back(); continue; }
+            if (segs.back().empty() && d < 0) continue;
+            segs.back().push_back(d);
+          }
+          for (auto &seg : segs) {
+            if (seg.size() < 8) continue;
+            uint8_t sym[80];
+            int n = 0;
+            int nm = 0;   // low pulses longer than 250 us: none in frame A, about 32 in frame B
+            for (auto v : seg) {
+              int a = v < 0 ? -v : v;
+              if (v >= 250) nm++;
+              if (a < 250 || a >= 1500) continue;
+              if (n >= 80) { n = 0; break; }
+              sym[n++] = a < 350 ? 0 : (a < 700 ? 1 : 2);
+            }
+            if (n == 48 && nm == 0) {
+              // frame A as seen by the hood: this is the effective state (it includes our own override)
+              uint8_t b[6] = {0,0,0,0,0,0};
+              bool ok = true;
+              for (int i = 0; i < 48; i++) {
+                if (sym[i] == 0) { ok = false; break; }
+                if (sym[i] == 2) b[i / 8] |= (1 << (i % 8));
+              }
+              if (!ok) { ESP_LOGD("hood", "A with a short symbol, %d items", (int) seg.size()); continue; }
+              uint8_t cs = (uint8_t) (b[0] + b[1] + b[2] + b[3]);
+              if (cs != b[4]) { ESP_LOGW("hood", "A checksum mismatch %02X %02X %02X %02X cs %02X", b[0], b[1], b[2], b[3], b[4]); continue; }
+              if (b[5] != 0) continue;
+              uint32_t key = ((uint32_t) b[0] << 24) | ((uint32_t) (b[1] & 0xFC) << 16) | ((uint32_t) b[2] << 8) | b[3];
+              if (key == id(last_frame)) continue;
+              id(last_frame) = key;
+              ESP_LOGI("hood", "A: %02X %02X %02X %02X", b[0], b[1], b[2], b[3]);
+              char hex[16];
+              snprintf(hex, sizeof(hex), "%02X %02X %02X %02X", b[0], b[1], b[2], b[3]);
+              id(frame_hex).publish_state(hex);
+              int lvl = b[0] == 0x00 ? 0 : b[0] == 0x12 ? 1 : b[0] == 0x1D ? 2 : b[0] == 0x2E ? 3 : -1;
+              id(fan_level).publish_state(lvl);
+              bool down = (b[1] & 0x08) != 0;
+              bool back = b[2] != 0;
+              id(eff_level) = lvl;
+              id(eff_down) = down;
+              id(eff_color) = b[2];
+              if (b[2] >= 1 && b[2] <= 9) id(last_color) = b[2];
+              id(backlight_color).publish_state(b[2]);
+              static const char *const COLORS[] = {"off", "white", "red", "green", "blue", "yellow-green", "pink", "yellow", "turquoise", "yellow-green"};
+              id(backlight_color_name).publish_state(b[2] <= 9 ? COLORS[b[2]] : "unknown");
+              id(light_mode).publish_state(down && back ? "both" : down ? "downlight" : back ? "backlight" : "off");
+              // the hood has not reached the override target yet: this frame is older than the command, keep the entities
+              if (id(ovr_active) && (lvl != id(ovr_level) || down != id(ovr_down) || b[2] != id(ovr_color))) continue;
+              if (b[2] <= 9) id(backlight_select).publish_state(COLORS[b[2]]);
+              // push the effective state into the entities without arming an override
+              id(syncing) = true;
+              id(hood_fan).state = lvl > 0;
+              if (lvl > 0) id(hood_fan).speed = lvl;
+              id(hood_fan).publish_state();
+              auto lc1 = id(downlight_light).make_call();
+              lc1.set_state(down);
+              lc1.perform();
+              auto lc2 = id(backlight_light).make_call();
+              lc2.set_state(back);
+              lc2.perform();
+              id(syncing) = false;
+              id(hood_power).update();
+              id(fan_power).update();
+              id(downlight_power).update();
+              id(backlight_power).update();
+            } else if (nm >= 28 && nm <= 36) {
+              // frame B from the hood board: decode the motor feedback (the panel already got its own answer)
+              id(relayed_b)++;
+              if (nm == 32) {
+                // the bits sit in the gaps between the low pulses: ~300 us = 0, ~1100 us = 1
+                uint32_t bits = 0;
+                int k = 0;
+                for (auto d : seg) {
+                  if (d > -250) continue;
+                  if (d <= -700) bits |= (1u << k);
+                  k++;
+                  if (k >= 32) break;
+                }
+                int v1 = (bits >> 16) & 0xFF;
+                int v2 = (bits >> 24) & 0xFF;
+                if (v1 == v2 && v1 != id(last_fb)) {
+                  id(last_fb) = v1;
+                  id(motor_fb).publish_state(v1);
+                  ESP_LOGD("hood", "motor feedback %d", v1);
+                }
+              }
+            }
+          }
+  - id: rx_panel_side
+    pin:
+      number: GPIO20
+      inverted: true
+    idle: 3ms
+    rmt_symbols: 48
+    receive_symbols: 192
+    tolerance: 30%
+    on_raw:
+      - lambda: |-
+          // frame A from the panel: forward to the hood line, rewritten while an override is active
+          std::vector<std::vector<int32_t>> segs(1);
+          for (auto d : x) {
+            int a = d < 0 ? -d : d;
+            if (a == 0) continue;
+            if (a >= 2000) { if (!segs.back().empty()) segs.emplace_back(); continue; }
+            if (segs.back().empty() && d < 0) continue;
+            segs.back().push_back(d);
+          }
+          for (auto &seg : segs) {
+            if (seg.size() < 8) continue;
+            uint8_t sym[80];
+            int n = 0;
+            for (auto v : seg) {
+              int a = v < 0 ? -v : v;
+              if (a < 250 || a >= 1500) continue;
+              if (n >= 80) { n = 0; break; }
+              sym[n++] = a < 350 ? 0 : (a < 700 ? 1 : 2);
+            }
+            if (n != 48) continue;   // our own answer frame B, or noise
+            // answer the panel at once: it expects frame B within a few ms, long before the hood's real answer
+            // can travel through this relay, and keeps retrying frame A otherwise
+            {
+              int fb = id(last_fb) < 0 ? 0 : id(last_fb);
+              uint32_t word = ((uint32_t) fb << 16) | ((uint32_t) fb << 24);
+              std::vector<int32_t> ans;
+              ans.reserve(70);
+              ans.push_back(220);
+              for (int i = 0; i < 32; i++) {
+                ans.push_back(((word >> i) & 1) ? -1100 : -300);
+                if (i < 31) ans.push_back(300);
+              }
+              ans.push_back(id(stop_us));
+              auto acall = id(tx_panel).transmit();
+              acall.get_data()->set_data(ans);
+              acall.perform();
+              id(answered_b)++;
+            }
+            uint8_t b[6] = {0,0,0,0,0,0};
+            bool ok = true;
+            for (int i = 0; i < 48; i++) {
+              if (sym[i] == 0) { ok = false; break; }
+              if (sym[i] == 2) b[i / 8] |= (1 << (i % 8));
+            }
+            bool decodable = ok && (uint8_t) (b[0] + b[1] + b[2] + b[3]) == b[4];
+            bool normal = decodable && b[5] == 0;
+            if (normal) {
+              id(pb0) = b[0];
+              id(pb1) = b[1];
+              id(pb2) = b[2];
+              if (id(ovr_active) && (b[0] != id(base_b0) || (b[1] & 0x18) != (id(base_b1) & 0x18) || b[2] != id(base_b2))) {
+                id(ovr_active) = false;
+                ESP_LOGI("hood", "panel changed (%02X %02X %02X), override released", b[0], b[1], b[2]);
+              }
+            }
+            // in an override never forward a frame we could not decode: raw it would carry the panel's own state
+            if (id(ovr_active) && !decodable) continue;
+            std::vector<int32_t> v = seg;
+            if (normal && id(ovr_active)) {
+              static const uint8_t CODES[] = {0x00, 0x12, 0x1D, 0x2E};
+              int lvl = id(ovr_level);
+              if (lvl < 0) lvl = 0;
+              if (lvl > 3) lvl = 3;
+              b[0] = CODES[lvl];
+              b[1] = (b[1] & ~0x18) | (lvl > 0 ? 0x10 : 0x00) | (id(ovr_down) ? 0x08 : 0x00);
+              b[2] = (uint8_t) id(ovr_color);
+              b[4] = (uint8_t) (b[0] + b[1] + b[2] + b[3]);
+              // patch the received timings in place: every data pulse gets the length of the new bit
+              int k = 0;
+              for (auto &d : v) {
+                int a = d < 0 ? -d : d;
+                if (a < 250 || a >= 1500) continue;
+                if (k >= 48) break;
+                int len = ((b[k / 8] >> (k % 8)) & 1) ? 1115 : 420;
+                d = d < 0 ? -len : len;
+                k++;
+              }
+            }
+            v.push_back(id(stop_us));
+            auto call = id(tx_hood).transmit();
+            call.get_data()->set_data(v);
+            call.perform();
+            id(relayed_a)++;
+          }
+
+output:
+  - platform: template
+    type: binary
+    id: downlight_out
+    write_action:
+      - lambda: |-
+          if (id(syncing) || id(pb0) < 0) return;
+          id(seed_override).execute();
+          if (id(ovr_down) == state) return;
+          id(ovr_down) = state;
+          id(arm_override).execute();
+  - platform: template
+    type: binary
+    id: backlight_out
+    write_action:
+      - lambda: |-
+          if (id(syncing) || id(pb0) < 0) return;
+          id(seed_override).execute();
+          if ((id(ovr_color) > 0) == state) return;
+          int lc = id(last_color) >= 1 && id(last_color) <= 9 ? id(last_color) : 1;
+          id(ovr_color) = state ? (id(eff_color) > 0 ? id(eff_color) : lc) : 0;
+          id(arm_override).execute();
+
+light:
+  - platform: binary
+    name: Downlight
+    id: downlight_light
+    icon: mdi:wall-sconce-flat
+    output: downlight_out
+    restore_mode: ALWAYS_OFF
+  - platform: binary
+    name: Backlight
+    id: backlight_light
+    icon: mdi:led-strip-variant
+    output: backlight_out
+    restore_mode: ALWAYS_OFF
+
+fan:
+  - platform: template
+    name: Fan
+    id: hood_fan
+    icon: mdi:fan
+    speed_count: 3
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - lambda: |-
+          if (id(syncing) || id(pb0) < 0) return;
+          int s = id(hood_fan).speed;
+          if (s < 1) s = 1;
+          if (s > 3) s = 3;
+          id(seed_override).execute();
+          if (id(ovr_level) == s) return;
+          id(ovr_level) = s;
+          id(arm_override).execute();
+    on_turn_off:
+      - lambda: |-
+          if (id(syncing) || id(pb0) < 0) return;
+          id(seed_override).execute();
+          if (id(ovr_level) == 0) return;
+          id(ovr_level) = 0;
+          id(arm_override).execute();
+    on_speed_set:
+      - lambda: |-
+          if (id(syncing) || id(pb0) < 0) return;
+          if (!id(hood_fan).state) return;
+          int s = id(hood_fan).speed;
+          if (s < 1) s = 1;
+          if (s > 3) s = 3;
+          id(seed_override).execute();
+          if (id(ovr_level) == s) return;
+          id(ovr_level) = s;
+          id(arm_override).execute();
+
+number:
+  - platform: template
+    name: Stop Pulse
+    icon: mdi:timer-outline
+    entity_category: config
+    unit_of_measurement: us
+    min_value: 500
+    max_value: 40000
+    step: 100
+    initial_value: 3500
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: |-
+          id(stop_us) = (int) x;
+          ESP_LOGI("hood", "stop pulse set to %d us", id(stop_us));
+
+sensor:
+  - platform: wifi_signal
+    name: Wi-Fi Signal
+    update_interval: 60s
+  - platform: sps30
+    id: sps30_sensor
+    pm_1_0:
+      id: pm_1_0
+      name: PM 1.0
+      filters:
+        - or:
+            - delta: 10%
+            - throttle: 60s
+    pm_2_5:
+      id: pm_2_5
+      name: PM 2.5
+      filters:
+        - or:
+            - delta: 10%
+            - throttle: 60s
+    pm_4_0:
+      id: pm_4_0
+      name: PM 4.0
+      filters:
+        - or:
+            - delta: 10%
+            - throttle: 60s
+    pm_10_0:
+      id: pm_10_0
+      name: PM 10
+      filters:
+        - or:
+            - delta: 10%
+            - throttle: 60s
+    pmc_0_5:
+      name: PM 0.5 Count
+      entity_category: diagnostic
+    pmc_1_0:
+      name: PM 1.0 Count
+      entity_category: diagnostic
+    pmc_2_5:
+      name: PM 2.5 Count
+      entity_category: diagnostic
+    pmc_4_0:
+      name: PM 4.0 Count
+      entity_category: diagnostic
+    pmc_10_0:
+      name: PM 10 Count
+      entity_category: diagnostic
+    pm_size:
+      name: Typical Particle Size
+      entity_category: diagnostic
+    update_interval: 5s
+  - platform: aht10
+    variant: AHT10
+    temperature:
+      name: Temperature
+      filters:
+        - delta: 0.2
+    humidity:
+      name: Humidity
+      filters:
+        - delta: 0.5
+    update_interval: 10s
+  - platform: template
+    id: fan_level
+    name: Fan Level
+    icon: mdi:fan
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: motor_fb
+    name: Motor Feedback
+    icon: mdi:speedometer
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: backlight_color
+    name: Backlight Color Index
+    icon: mdi:palette
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: template
+    id: hood_power
+    name: Power
+    icon: mdi:flash
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      // estimated from the measured model in the header comment, standby included
+      static const float FAN[] = {0.0f, 7.6f, 12.9f, 20.9f};
+      static const float COLOR[] = {0.0f, 7.1f, 2.3f, 2.8f, 2.6f, 4.8f, 4.6f, 3.4f, 5.0f, 4.9f};
+      float p = 1.6f;
+      int l = id(eff_level);
+      if (l >= 1 && l <= 3) p += FAN[l];
+      if (id(eff_down)) p += 2.1f;
+      int c = id(eff_color);
+      // the backlight draws about 15 % less while the downlight is on
+      if (c >= 1 && c <= 9) p += id(eff_down) ? COLOR[c] * 0.85f : COLOR[c];
+      return p;
+  - platform: template
+    id: fan_power
+    name: Fan Power
+    icon: mdi:fan
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      // fan only, without the standby of the electronics
+      static const float FAN[] = {0.0f, 7.6f, 12.9f, 20.9f};
+      int l = id(eff_level);
+      return (l >= 1 && l <= 3) ? FAN[l] : 0.0f;
+  - platform: template
+    id: downlight_power
+    name: Downlight Power
+    icon: mdi:wall-sconce-flat
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      return id(eff_down) ? 2.1f : 0.0f;
+  - platform: template
+    id: backlight_power
+    name: Backlight Power
+    icon: mdi:led-strip-variant
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      static const float COLOR[] = {0.0f, 7.1f, 2.3f, 2.8f, 2.6f, 4.8f, 4.6f, 3.4f, 5.0f, 4.9f};
+      int c = id(eff_color);
+      if (c < 1 || c > 9) return 0.0f;
+      return id(eff_down) ? COLOR[c] * 0.85f : COLOR[c];
+  - platform: integration
+    name: Fan Energy
+    icon: mdi:lightning-bolt
+    sensor: fan_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+      - delta: 0.001
+  - platform: total_daily_energy
+    name: Energy Today
+    icon: mdi:lightning-bolt
+    power_id: hood_power
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+      - delta: 0.001
+  - platform: integration
+    name: Energy Total
+    icon: mdi:lightning-bolt
+    sensor: hood_power
+    time_unit: h
+    restore: true
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 3
+    filters:
+      - multiply: 0.001
+      - delta: 0.001
+  - platform: template
+    name: Relayed Panel Frames
+    icon: mdi:swap-horizontal
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: return id(relayed_a);
+  - platform: template
+    name: Relayed Hood Frames
+    icon: mdi:swap-horizontal
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: return id(relayed_b);
+  - platform: template
+    name: Answered Panel Frames
+    icon: mdi:reply
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: return id(answered_b);
+
+text_sensor:
+  - platform: template
+    id: light_mode
+    name: Light Mode
+    icon: mdi:lightbulb-group
+    update_interval: never
+  - platform: template
+    id: backlight_color_name
+    name: Backlight Color
+    icon: mdi:palette
+    update_interval: never
+  - platform: template
+    id: frame_hex
+    name: Frame A
+    entity_category: diagnostic
+    update_interval: never
+
+binary_sensor:
+  - platform: status
+    name: Status
+  - platform: template
+    name: Panel Lit
+    icon: mdi:gesture-tap-button
+    lambda: |-
+      // the glass panel lights its buttons while it believes the hood is active
+      if (id(pb0) < 0 || id(pb1) < 0 || id(pb2) < 0) return false;
+      return id(pb0) != 0 || (id(pb1) & 0x18) != 0 || id(pb2) != 0;
+  - platform: template
+    name: Override Active
+    icon: mdi:hand-back-right
+    entity_category: diagnostic
+    lambda: return id(ovr_active);
+
+select:
+  - platform: template
+    name: Backlight Select
+    id: backlight_select
+    icon: mdi:palette
+    options: ["off", "white", "red", "green", "blue", "pink", "yellow", "turquoise", "yellow-green"]
+    # no polling: the frame A decoder publishes the hood's colour as soon as it changes
+    update_interval: never
+    lambda: |-
+      // code 5 (lime) looks exactly like code 9 (yellow-green), both show as yellow-green
+      static const char *const COLORS[] = {"off", "white", "red", "green", "blue", "yellow-green", "pink", "yellow", "turquoise", "yellow-green"};
+      int c = id(eff_color);
+      return std::string(c >= 0 && c <= 9 ? COLORS[c] : "off");
+    set_action:
+      - lambda: |-
+          static const char *const OPTIONS[] = {"off", "white", "red", "green", "blue", "pink", "yellow", "turquoise", "yellow-green"};
+          static const int CODES[] = {0, 1, 2, 3, 4, 6, 7, 8, 9};
+          int c = 0;
+          for (int i = 0; i < 9; i++) if (x == OPTIONS[i]) c = CODES[i];
+          id(seed_override).execute();
+          // show the requested colour at once; the next decoded frame A confirms or corrects it
+          id(backlight_select).publish_state(x);
+          if (c > 0) id(last_color) = c;
+          if (id(ovr_color) == c) return;
+          id(ovr_color) = c;
+          id(arm_override).execute();
+
+switch:
+  - platform: template
+    name: Dust Sensor
+    id: dust_sensor_switch
+    icon: mdi:air-filter
+    restore_mode: DISABLED
+    lambda: return id(sps30_on);
+    turn_on_action:
+      - sps30.start_measurement: sps30_sensor
+      - lambda: id(sps30_on) = true;
+    turn_off_action:
+      - sps30.stop_measurement: sps30_sensor
+      - lambda: |-
+          id(sps30_on) = false;
+          id(pm_1_0).publish_state(NAN);
+          id(pm_2_5).publish_state(NAN);
+          id(pm_4_0).publish_state(NAN);
+          id(pm_10_0).publish_state(NAN);
+
+button:
+  - platform: template
+    name: SPS30 Fan Clean
+    icon: mdi:fan-auto
+    entity_category: config
+    on_press:
+      - sps30.start_fan_autoclean: sps30_sensor
+  - platform: template
+    name: Follow Panel
+    icon: mdi:gesture-tap
+    on_press:
+      - lambda: |-
+          id(ovr_active) = false;
+          ESP_LOGI("hood", "override released by button");
