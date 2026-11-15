@@ -50,6 +50,24 @@ Pins: GPIO18 RX hood line, GPIO19 TX hood line, GPIO20 RX panel line, GPIO21 TX 
 
 The parts list is in [BOM.md](BOM.md).
 
+## Photos
+
+CN2 on the hood main board. TXD is not used by the hood, RXD carries the single data wire:
+
+![CN2 pinout on the hood main board](photos/hood_main_board_cn2.jpg)
+
+The finished harness in its printed case, with the ESP32-C6, the interface module and the SPS30:
+
+![Harness board in the case](photos/harness_board_in_case.jpg)
+
+The case next to the hood main board, with the pigtail plugged into CN2:
+
+![Case installed next to the main board](photos/installed_in_hood.jpg)
+
+The hood interior with the controller box and the rating plate (110 W motor, 9 W lights). The QR code and serial number are blurred:
+
+![Hood interior](photos/hood_interior.jpg)
+
 ## Files
 
 | Path | Content |
@@ -61,6 +79,7 @@ The parts list is in [BOM.md](BOM.md).
 | [esphome/secrets.yaml.example](esphome/secrets.yaml.example) | Secrets the firmware expects |
 | [ha_entities.md](ha_entities.md) | Home Assistant entities with example values |
 | [case/](case) | STL files for the case bottom and lid |
+| [photos/](photos) | Photos of the hood, the main board connector and the build |
 
 ## Build and flash
 
