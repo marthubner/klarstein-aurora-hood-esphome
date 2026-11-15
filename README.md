@@ -48,7 +48,7 @@ Power, ground and the panel's TX wire pass straight through.
 
 Pins: GPIO18 RX hood line, GPIO19 TX hood line, GPIO20 RX panel line, GPIO21 TX panel line, GPIO22 SDA, GPIO23 SCL.
 
-The parts list is in [BOM.md](BOM.md).
+The connections between the parts, including where the capacitors go, are in [wiring_complete.svg](wiring_complete.svg). The parts list is in [BOM.md](BOM.md).
 
 ## Photos
 
@@ -73,6 +73,7 @@ The hood interior with the controller box and the rating plate (110 W motor, 9 W
 | Path | Content |
 |---|---|
 | [system_overview.svg](system_overview.svg) | Block diagram: hood board, panel, interface, ESP32-C6, sensors |
+| [wiring_complete.svg](wiring_complete.svg) | Complete wiring diagram: every connection, both power rails and the two capacitors |
 | [interface_schematic.svg](interface_schematic.svg) | Circuit of the interface: receive divider and transmit transistor per line |
 | [BOM.md](BOM.md) | Bill of materials |
 | [esphome/range-hood.yaml](esphome/range-hood.yaml) | ESPHome firmware |
