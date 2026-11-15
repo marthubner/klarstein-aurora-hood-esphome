@@ -99,6 +99,7 @@ The hood interior with the controller box and the rating plate (110 W motor, 9 W
 - The power figures are a measured model, not a live measurement. They match a plug meter within about 0.5 W on the
   tested hood.
 - Turning the fan on takes about 12 s to reach speed. Motor feedback shows the ramp.
+- **Case:** The USB-C cutout in the printed case is too far from the board. With the ESP32-C6 in place, the cable cannot be plugged in directly. Flash the first firmware before the board goes into the case. Later updates go over the air. The STL files need a corrected cutout.
 
 ## Safety
 
