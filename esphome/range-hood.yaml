@@ -1,6 +1,6 @@
 # Range hood controller: ESP32-C6 between the hood main board and the glass touch panel.
 #
-# The hood's single-wire bus (touch panel <-> main board) is cut. Both halves are connected only to this ESP, which
+# The hood's single-wire bus (touch panel <-> main board) is split on a harness board. Both halves are connected only to this ESP, which
 # relays the traffic and can override the fan and lights from Home Assistant. See ../interface_schematic.svg and
 # ../system_overview.svg for the hardware.
 #
